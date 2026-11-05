@@ -130,6 +130,18 @@ services:
       start_period: 30s
 
   # =============================================
+  # RABBITMQ
+  # =============================================
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: lumina-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - lumina-network
+
+  # =============================================
   # MICROSERVICIOS
   # =============================================
 
@@ -140,6 +152,8 @@ services:
       - "8080:8080"
     environment:
       - SPRING_PROFILES_ACTIVE=docker
+      - SPRING_RABBITMQ_HOST=rabbitmq
+      - SPRING_RABBITMQ_PORT=5672
       - MS_USUARIOS_URL=http://ms-usuarios:8081
       - MS_PRODUCTOS_URL=http://ms-productos:8082
       - MS_BODEGA_URL=http://ms-bodega:8083
@@ -147,12 +161,20 @@ services:
       - MS_DELIVERY_URL=http://ms-delivery:8085
       - MS_PAGOS_URL=http://ms-pagos:8086
     depends_on:
-      - ms-usuarios
-      - ms-productos
-      - ms-bodega
-      - ms-carrito
-      - ms-delivery
-      - ms-pagos
+      rabbitmq:
+        condition: service_started
+      ms-usuarios:
+        condition: service_started
+      ms-productos:
+        condition: service_started
+      ms-bodega:
+        condition: service_started
+      ms-carrito:
+        condition: service_started
+      ms-delivery:
+        condition: service_started
+      ms-pagos:
+        condition: service_started
     networks:
       - lumina-network
 

@@ -21,14 +21,12 @@ spring:
       region:
         static: ${AWS_REGION:us-east-1}
       credentials:
-        # Credenciales AWS via variables de entorno (AWS Academy / IAM role / perfil).
-        # Sin credenciales explicitas se usa la cadena por defecto del AWS SDK.
-        # Spring Cloud AWS 3.x no expone el session-token como property oficial
-        # (CredentialsProperties solo bindea access-key/secret-key), por eso
-        # AwsCredentialsConfig lo lee de aqui para soportar credenciales temporales.
-        access-key: ${AWS_ACCESS_KEY_ID:}
-        secret-key: ${AWS_SECRET_ACCESS_KEY:}
-        session-token: ${AWS_SESSION_TOKEN:}
+        # Nuevas credenciales actualizadas desde AWS Academy:
+        aws:
+            access-key-id: ${AWS_ACCESS_KEY_ID:}
+            secret-access-key: ${AWS_SECRET_ACCESS_KEY:}
+            session-token: ${AWS_SESSION_TOKEN:}
+
       sqs:
         # La cola "curso-pedidos" YA existe en AWS con su redrive policy hacia
         # "curso-pedidos-dlq". Con el default (CREATE) el framework crearia una cola

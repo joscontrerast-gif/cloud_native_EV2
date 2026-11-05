@@ -18,7 +18,7 @@ public class CrearPreferenciaRequest {
     private String ordenId;
 
     @NotNull(message = "El ID de usuario es obligatorio")
-    private Long usuarioId;
+    private String usuarioId;
 
     @NotNull(message = "Los items son obligatorios")
     private List<ItemRequest> items;

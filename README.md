@@ -101,6 +101,7 @@ npm run dev
 
 - **Tienda:** http://localhost:5173
 - **API Gateway:** http://localhost:8080
+- **ADMIN MQ:**   
 
 ### Credenciales de Admin
 
