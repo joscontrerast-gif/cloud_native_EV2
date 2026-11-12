@@ -1,279 +1,245 @@
 package com.lumina.pagos.service;
 
-import com.lumina.pagos.dto.CrearPreferenciaRequest;
-import com.lumina.pagos.dto.ItemPedidoDto;
-import com.lumina.pagos.dto.PagoResponse;
-import com.lumina.pagos.dto.PedidoPagadoDto;
-import com.lumina.pagos.entity.EstadoPago;
-import com.lumina.pagos.entity.ItemPago;
-import com.lumina.pagos.entity.Pago;
-import com.lumina.pagos.messaging.PedidoSqsPublisher;
-import com.lumina.pagos.repository.ItemPagoRepository;
+import com.lumina.pagos.client.MercadoPagoClient;
+import com.lumina.pagos.client.MercadoPagoPreferenceResult;
+import com.lumina.pagos.dto.*;
+import com.lumina.pagos.event.PagoEventPublisher;
+import com.lumina.pagos.event.PagoExitosoEvent;
+import com.lumina.pagos.event.PedidoSqsPublisher;
+import com.lumina.pagos.exception.PagoNotFoundException;
+import com.lumina.pagos.model.EstadoPago;
+import com.lumina.pagos.model.Pago;
 import com.lumina.pagos.repository.PagoRepository;
-import com.mercadopago.client.payment.PaymentClient;
-import com.mercadopago.client.preference.*;
-import com.mercadopago.resources.payment.Payment;
-import com.mercadopago.resources.preference.Preference;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
-@Slf4j
 public class PagoService {
 
     private final PagoRepository pagoRepository;
-    private final ItemPagoRepository itemPagoRepository;
+    private final MercadoPagoClient mercadoPagoClient;
+    private final PagoEventPublisher eventPublisher;
     private final PedidoSqsPublisher pedidoSqsPublisher;
-    private final PreferenceClient preferenceClient;
-    private final PaymentClient paymentClient;
-
-    @Value("${mercadopago.notification-url}")
-    private String notificationUrl;
 
     @Transactional
-    public PagoResponse crearPreferencia(CrearPreferenciaRequest request) {
-        try {
-            // Calcular monto total
-            BigDecimal montoTotal = request.getItems().stream()
-                    .map(item -> item.getPrecioUnitario().multiply(BigDecimal.valueOf(item.getCantidad())))
-                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+    public PreferenciaResponse crearPreferencia(CrearPreferenciaRequest request) {
+        BigDecimal montoTotal = request.getItems().stream()
+                .map(item -> item.getPrecioUnitario().multiply(BigDecimal.valueOf(item.getCantidad())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-            // Crear items para MercadoPago
-            List<PreferenceItemRequest> mpItems = new ArrayList<>();
-            for (CrearPreferenciaRequest.ItemRequest item : request.getItems()) {
-                PreferenceItemRequest.PreferenceItemRequestBuilder itemBuilder = PreferenceItemRequest.builder()
-                        .title(item.getTitulo())
-                        .quantity(item.getCantidad())
-                        .unitPrice(item.getPrecioUnitario())
-                        .currencyId("CLP");
+        Pago pago = Pago.builder()
+                .ordenId(request.getOrdenId())
+                .usuarioId(request.getUsuarioId())
+                .monto(montoTotal)
+                .moneda("CLP")
+                .estado(EstadoPago.PENDIENTE)
+                .descripcion("Orden #" + request.getOrdenId())
+                .build();
 
-                if (item.getDescripcion() != null && !item.getDescripcion().isBlank()) {
-                    itemBuilder.description(item.getDescripcion());
-                }
-                if (item.getImagenUrl() != null && !item.getImagenUrl().isBlank()) {
-                    itemBuilder.pictureUrl(item.getImagenUrl());
-                }
+        pago = pagoRepository.save(pago);
 
-                mpItems.add(itemBuilder.build());
-            }
+        MercadoPagoPreferenceResult mpResult = mercadoPagoClient.crearPreferencia(request, pago.getId());
 
-            // Configurar back URLs para redirección
-            PreferenceBackUrlsRequest backUrls = PreferenceBackUrlsRequest.builder()
-                    .success("http://localhost:5173/pago/exitoso")
-                    .failure("http://localhost:5173/pago/fallido")
-                    .pending("http://localhost:5173/pago/exitoso")
-                    .build();
+        pago.setMpPreferenceId(mpResult.getPreferenceId());
+        pago.setMpInitPoint(mpResult.getInitPoint());
+        pago = pagoRepository.save(pago);
 
-            // Construir la preferencia
-            PreferenceRequest.PreferenceRequestBuilder prefBuilder = PreferenceRequest.builder()
-                    .items(mpItems)
-                    .backUrls(backUrls)
-                    .externalReference(request.getOrdenId());
+        log.info("Pago creado y preferencia generada: pagoId={}, ordenId={}, mpPreferenceId={}",
+                pago.getId(), pago.getOrdenId(), mpResult.getPreferenceId());
 
-            // Solo agregar notificationUrl si no es localhost
-            if (notificationUrl != null && !notificationUrl.contains("localhost")) {
-                prefBuilder.notificationUrl(notificationUrl);
-            }
-
-            PreferenceRequest preferenceRequest = prefBuilder.build();
-
-            // Crear preferencia en MercadoPago
-            Preference preference = preferenceClient.create(preferenceRequest);
-
-            // Persistir el pago en la BD
-            Pago pago = Pago.builder()
-                    .ordenId(request.getOrdenId())
-                    .usuarioId(request.getUsuarioId())
-                    .montoTotal(montoTotal)
-                    .moneda("CLP")
-                    .estado(EstadoPago.PENDIENTE)
-                    .mercadopagoPreferenceId(preference.getId())
-                    .build();
-
-            pago = pagoRepository.save(pago);
-
-            // Se guardan los items para poder reconstruir el evento "pedido pagado" cuando
-            // MercadoPago notifique la aprobacion del pago.
-            guardarItemsPedido(pago, request.getItems());
-
-            log.info("Preferencia creada: {} para orden: {}", preference.getId(), request.getOrdenId());
-
-            return mapToResponse(pago, preference.getInitPoint(), preference.getSandboxInitPoint());
-
-        } catch (com.mercadopago.exceptions.MPApiException apiEx) {
-            log.error("MercadoPago API Error para orden {}: Status={}, Content={}",
-                    request.getOrdenId(), apiEx.getStatusCode(), apiEx.getApiResponse().getContent());
-            throw new RuntimeException("Error MercadoPago: " + apiEx.getApiResponse().getContent(), apiEx);
-        } catch (Exception e) {
-            log.error("Error al crear preferencia de pago para orden {}: {}", request.getOrdenId(), e.getMessage());
-            throw new RuntimeException("Error al crear preferencia de pago: " + e.getMessage(), e);
-        }
+        return PreferenciaResponse.builder()
+                .pagoId(pago.getId())
+                .ordenId(pago.getOrdenId())
+                .monto(pago.getMonto())
+                .moneda(pago.getMoneda())
+                .estado(pago.getEstado())
+                .mpPreferenceId(mpResult.getPreferenceId())
+                .initPoint(mpResult.getInitPoint())
+                .sandboxInitPoint(mpResult.getSandboxInitPoint())
+                .build();
     }
 
     @Transactional
-    public void procesarNotificacion(String topic, Long resourceId) {
-        log.info("Webhook recibido - topic: {}, resourceId: {}", topic, resourceId);
+    public PagoResponse simularPagoAprobado(CrearPreferenciaRequest request) {
+        BigDecimal montoTotal = request.getItems().stream()
+                .map(item -> item.getPrecioUnitario().multiply(BigDecimal.valueOf(item.getCantidad())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        if (!"payment".equals(topic)) {
-            log.info("Notificación ignorada, topic: {}", topic);
-            return;
-        }
+        String simulatedPaymentId = "SIM-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
 
-        try {
-            Payment payment = paymentClient.get(resourceId);
+        Pago pago = Pago.builder()
+                .ordenId(request.getOrdenId())
+                .usuarioId(request.getUsuarioId())
+                .monto(montoTotal)
+                .moneda("CLP")
+                .estado(EstadoPago.APROBADO)
+                .mpPaymentId(simulatedPaymentId)
+                .mpStatus("approved")
+                .mpStatusDetail("accredited_simulation")
+                .metodoPago("simulacion_demo")
+                .descripcion("Simulación Orden #" + request.getOrdenId())
+                .fechaPago(LocalDateTime.now())
+                .build();
 
-            String externalReference = payment.getExternalReference();
-            String paymentStatus = payment.getStatus();
+        pago = pagoRepository.save(pago);
+        log.info("Pago simulado aprobado: pagoId={}, ordenId={}, mpPaymentId={}",
+                pago.getId(), pago.getOrdenId(), simulatedPaymentId);
 
-            log.info("Payment ID: {}, Status: {}, ExternalRef: {}",
-                    payment.getId(), paymentStatus, externalReference);
-
-            // Buscar pagos por orden (external reference)
-            List<Pago> pagos = pagoRepository.findByOrdenId(externalReference);
-
-            if (pagos.isEmpty()) {
-                log.warn("No se encontró pago para external_reference: {}", externalReference);
-                return;
-            }
-
-            Pago pago = pagos.get(0);
-            pago.setMercadopagoPaymentId(String.valueOf(payment.getId()));
-            pago.setMercadopagoStatus(paymentStatus);
-            pago.setMercadopagoStatusDetail(payment.getStatusDetail());
-            pago.setMetodoPago(payment.getPaymentMethodId());
-            pago.setEstado(mapearEstado(paymentStatus));
-
-            pagoRepository.save(pago);
-
-            log.info("Pago actualizado - ID: {}, Estado: {}", pago.getId(), pago.getEstado());
-
-            // El pedido se publica en SQS solo cuando el pago queda aprobado: ms-bodega es el
-            // consumidor y descuenta el stock del inventario.
-            if (pago.getEstado() == EstadoPago.APROBADO) {
-                publicarPedidoPagado(pago);
-            }
-
-        } catch (Exception e) {
-            log.error("Error procesando webhook de pago: {}", e.getMessage());
-            throw new RuntimeException("Error procesando notificación de pago", e);
-        }
-    }
-
-    /**
-     * Persiste los items del pedido para poder reconstruir el evento que se publica en SQS.
-     *
-     * @param pago  pago recien creado
-     * @param items items de la solicitud de preference
-     */
-    private void guardarItemsPedido(Pago pago, List<CrearPreferenciaRequest.ItemRequest> items) {
-        List<ItemPago> itemsPago = items.stream()
-                .map(item -> ItemPago.builder()
-                        .pagoId(pago.getId())
-                        .ordenId(pago.getOrdenId())
+        List<PedidoPagadoDto.ItemPedidoDto> itemsDto = request.getItems().stream()
+                .map(item -> PedidoPagadoDto.ItemPedidoDto.builder()
                         .productoId(item.getProductoId())
                         .nombreProducto(item.getTitulo())
                         .cantidad(item.getCantidad())
+                        .precioUnitario(item.getPrecioUnitario())
                         .build())
-                .collect(Collectors.toList());
+                .toList();
 
-        itemPagoRepository.saveAll(itemsPago);
+        pedidoSqsPublisher.publicarPedidoPagado(PedidoPagadoDto.builder()
+                .ordenId(pago.getOrdenId())
+                .usuarioId(pago.getUsuarioId())
+                .montoTotal(pago.getMonto())
+                .estado("PAGADO")
+                .items(itemsDto)
+                .build());
+
+        eventPublisher.publicarPagoExitoso(PagoExitosoEvent.builder()
+                .pagoId(pago.getId())
+                .ordenId(pago.getOrdenId())
+                .usuarioId(pago.getUsuarioId())
+                .monto(pago.getMonto())
+                .moneda(pago.getMoneda())
+                .mpPaymentId(simulatedPaymentId)
+                .metodoPago("simulacion_demo")
+                .fechaPago(LocalDateTime.now())
+                .build());
+
+        return mapToResponse(pago);
     }
 
-    /**
-     * Publica el evento "pedido pagado" en la cola "curso-pedidos".
-     *
-     * <p>Si hay una transaccion activa la publicacion se difiere al {@code afterCommit} para no
-     * emitir el evento de una transaccion que finalmente hace rollback.</p>
-     *
-     * @param pago pago aprobado
-     */
-    private void publicarPedidoPagado(Pago pago) {
-        List<ItemPago> items = itemPagoRepository.findByOrdenId(pago.getOrdenId());
-
-        if (items.isEmpty()) {
-            log.warn("No hay items registrados para la orden {}. No se publica el evento a SQS", pago.getOrdenId());
+    @Transactional
+    public void procesarWebhookPago(String mpPaymentId) {
+        if (mpPaymentId == null || mpPaymentId.isBlank()) {
             return;
         }
 
-        PedidoPagadoDto evento = PedidoPagadoDto.builder()
-                .ordenId(pago.getOrdenId())
-                .usuarioId(pago.getUsuarioId())
-                .items(items.stream()
-                        .map(item -> ItemPedidoDto.builder()
-                                .productoId(item.getProductoId())
-                                .nombreProducto(item.getNombreProducto())
-                                .cantidad(item.getCantidad())
-                                .build())
-                        .collect(Collectors.toList()))
-                .montoTotal(pago.getMontoTotal())
-                .moneda(pago.getMoneda())
-                .fechaPago(pago.getFechaActualizacion() != null ? pago.getFechaActualizacion() : LocalDateTime.now())
-                .build();
+        var existingByPaymentId = pagoRepository.findByMpPaymentId(mpPaymentId);
+        if (existingByPaymentId.isPresent() && existingByPaymentId.get().getEstado() == EstadoPago.APROBADO) {
+            log.info("Pago ya procesado anteriormente (idempotencia): mpPaymentId={}", mpPaymentId);
+            return;
+        }
 
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    pedidoSqsPublisher.publicarPedidoPagado(evento);
-                }
-            });
-        } else {
-            pedidoSqsPublisher.publicarPedidoPagado(evento);
+        var paymentInfoOpt = mercadoPagoClient.obtenerPago(mpPaymentId);
+        if (paymentInfoOpt.isEmpty()) {
+            log.warn("No se pudo obtener informacion del pago desde MP: mpPaymentId={}", mpPaymentId);
+            return;
+        }
+
+        var paymentInfo = paymentInfoOpt.get();
+        String externalRef = paymentInfo.getExternalReference();
+        if (externalRef == null || externalRef.isBlank()) {
+            log.warn("Pago de MP sin external_reference: mpPaymentId={}", mpPaymentId);
+            return;
+        }
+
+        Pago pago = pagoRepository.findByOrdenId(externalRef)
+                .orElseGet(() -> pagoRepository.findById(Long.parseLong(externalRef))
+                        .orElseThrow(() -> new PagoNotFoundException("Pago no encontrado para referencia: " + externalRef)));
+
+        if (pago.getEstado() == EstadoPago.APROBADO) {
+            log.info("Pago ya estaba aprobado: pagoId={}", pago.getId());
+            return;
+        }
+
+        pago.setMpPaymentId(mpPaymentId);
+        pago.setMpStatus(paymentInfo.getStatus());
+        pago.setMpStatusDetail(paymentInfo.getStatusDetail());
+        pago.setMetodoPago(paymentInfo.getPaymentMethodId());
+
+        switch (paymentInfo.getStatus()) {
+            case "approved" -> {
+                pago.setEstado(EstadoPago.APROBADO);
+                pago.setFechaPago(LocalDateTime.now());
+                pagoRepository.save(pago);
+
+                log.info("Pago APROBADO: pagoId={}, ordenId={}, mpPaymentId={}",
+                        pago.getId(), pago.getOrdenId(), mpPaymentId);
+
+                eventPublisher.publicarPagoExitoso(PagoExitosoEvent.builder()
+                        .pagoId(pago.getId())
+                        .ordenId(pago.getOrdenId())
+                        .usuarioId(pago.getUsuarioId())
+                        .monto(pago.getMonto())
+                        .moneda(pago.getMoneda())
+                        .mpPaymentId(mpPaymentId)
+                        .metodoPago(paymentInfo.getPaymentMethodId())
+                        .fechaPago(LocalDateTime.now())
+                        .build());
+
+                pedidoSqsPublisher.publicarPedidoPagado(PedidoPagadoDto.builder()
+                        .ordenId(pago.getOrdenId())
+                        .usuarioId(pago.getUsuarioId())
+                        .montoTotal(pago.getMonto())
+                        .estado("PAGADO")
+                        .build());
+            }
+            case "rejected" -> {
+                pago.setEstado(EstadoPago.RECHAZADO);
+                pagoRepository.save(pago);
+                log.info("Pago RECHAZADO: pagoId={}, ordenId={}, detail={}",
+                        pago.getId(), pago.getOrdenId(), paymentInfo.getStatusDetail());
+            }
+            case "cancelled" -> {
+                pago.setEstado(EstadoPago.CANCELADO);
+                pagoRepository.save(pago);
+                log.info("Pago CANCELADO: pagoId={}, ordenId={}", pago.getId(), pago.getOrdenId());
+            }
+            default -> {
+                pago.setEstado(EstadoPago.EN_PROCESO);
+                pagoRepository.save(pago);
+                log.info("Pago en estado intermedio ({}): pagoId={}", paymentInfo.getStatus(), pago.getId());
+            }
         }
     }
 
+    @Transactional(readOnly = true)
     public PagoResponse obtenerPago(Long id) {
         Pago pago = pagoRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Pago no encontrado con ID: " + id));
-        return mapToResponse(pago, null, null);
+                .orElseThrow(() -> new PagoNotFoundException("Pago no encontrado con ID: " + id));
+        return mapToResponse(pago);
     }
 
-    public List<PagoResponse> obtenerPagosPorOrden(String ordenId) {
-        return pagoRepository.findByOrdenId(ordenId).stream()
-                .map(pago -> mapToResponse(pago, null, null))
-                .collect(Collectors.toList());
+    @Transactional(readOnly = true)
+    public PagoResponse obtenerPagoPorOrden(String ordenId) {
+        Pago pago = pagoRepository.findByOrdenId(ordenId)
+                .orElseThrow(() -> new PagoNotFoundException("Pago no encontrado para orden: " + ordenId));
+        return mapToResponse(pago);
     }
 
-    private EstadoPago mapearEstado(String mpStatus) {
-        return switch (mpStatus) {
-            case "approved" -> EstadoPago.APROBADO;
-            case "pending", "in_process" -> EstadoPago.PROCESANDO;
-            case "rejected" -> EstadoPago.RECHAZADO;
-            case "cancelled" -> EstadoPago.CANCELADO;
-            case "refunded" -> EstadoPago.REEMBOLSADO;
-            case "in_mediation" -> EstadoPago.EN_MEDIACION;
-            default -> EstadoPago.PENDIENTE;
-        };
-    }
-
-    private PagoResponse mapToResponse(Pago pago, String initPoint, String sandboxInitPoint) {
+    private PagoResponse mapToResponse(Pago pago) {
         return PagoResponse.builder()
                 .id(pago.getId())
                 .ordenId(pago.getOrdenId())
                 .usuarioId(pago.getUsuarioId())
-                .montoTotal(pago.getMontoTotal())
+                .monto(pago.getMonto())
                 .moneda(pago.getMoneda())
                 .estado(pago.getEstado())
-                .mercadopagoPreferenceId(pago.getMercadopagoPreferenceId())
-                .mercadopagoPaymentId(pago.getMercadopagoPaymentId())
-                .mercadopagoStatus(pago.getMercadopagoStatus())
+                .mpPreferenceId(pago.getMpPreferenceId())
+                .mpPaymentId(pago.getMpPaymentId())
+                .mpStatus(pago.getMpStatus())
+                .mpStatusDetail(pago.getMpStatusDetail())
                 .metodoPago(pago.getMetodoPago())
-                .fechaCreacion(pago.getFechaCreacion())
-                .fechaActualizacion(pago.getFechaActualizacion())
-                .initPoint(initPoint)
-                .sandboxInitPoint(sandboxInitPoint)
+                .descripcion(pago.getDescripcion())
+                .fechaPago(pago.getFechaPago())
+                .creadoEn(pago.getCreadoEn())
                 .build();
     }
 }

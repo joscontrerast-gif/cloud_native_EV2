@@ -1,13 +1,12 @@
 import { useState } from 'react';
-import { motion } from 'framer-motion';
-import { Trash2, Plus, Minus, ShoppingBag, CreditCard, Loader2 } from 'lucide-react';
+import { Link, useNavigate } from 'react-router-dom';
 import { useCart } from '../context/CartContext';
 import { useAuth } from '../context/AuthContext';
 import { pagosService, bodegaService } from '../services/api';
-import { Link, useNavigate } from 'react-router-dom';
+import { formatCLP } from '../utils/format';
 
-function CarritoPage() {
-  const { items, removeItem, updateQuantity, totalItems, totalPrice, clearCart } = useCart();
+export default function CarritoPage() {
+  const { items, updateQuantity, removeItem, clearCart, totalPrice, totalItems } = useCart();
   const { user, isAuthenticated } = useAuth();
   const navigate = useNavigate();
   const [pagando, setPagando] = useState(false);
@@ -18,15 +17,14 @@ function CarritoPage() {
       navigate('/login');
       return;
     }
-
     setPagando(true);
     setError('');
-
     try {
       const ordenId = 'ORD-' + Date.now();
       const payload = {
         ordenId,
         usuarioId: user?.id || 1,
+        emailComprador: user?.email,
         items: items.map((item) => ({
           titulo: item.nombre,
           productoId: item.id,
@@ -36,179 +34,180 @@ function CarritoPage() {
           imagenUrl: item.imagen || '',
         })),
       };
-
-      const response = await pagosService.crearPreferencia(payload);
-      const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
-
-      const checkoutUrl = data.sandboxInitPoint || data.initPoint;
-      if (checkoutUrl) {
-        const pedido = { ordenId, estado: 'reparto', timestamp: Date.now(), items: items.length, total: totalPrice };
-        const pedidosKey = `lumina-pedidos-${user?.id || 'guest'}`;
-        const pedidos = JSON.parse(localStorage.getItem(pedidosKey) || '[]');
-        pedidos.push(pedido);
-        localStorage.setItem(pedidosKey, JSON.stringify(pedidos));
-        localStorage.setItem('lumina-last-orden', ordenId);
-        // El stock NO se descuenta aqui: ms-pagos publica el evento "pedido pagado" en la
-        // cola SQS "curso-pedidos" y ms-bodega lo consume para descontar el inventario.
-        clearCart();
-        window.location.href = checkoutUrl;
+      const { data } = await pagosService.crearPreferencia(payload);
+      localStorage.setItem('lumina-last-orden', ordenId);
+      const url = data.sandboxInitPoint || data.initPoint;
+      if (url) {
+        window.location.href = url;
       } else {
-        setError('No se pudo obtener el enlace de pago. Verifica que el backend esté corriendo.');
+        setError('No se obtuvo URL de pago');
       }
     } catch (err) {
-      console.error('Error al crear preferencia:', err);
-      if (err.code === 'ERR_NETWORK') {
-        setError('El servidor de pagos no está disponible. Levanta el backend con: docker-compose up -d');
-      } else {
-        const msg = err.response?.data?.message || err.response?.data;
-        setError(typeof msg === 'string' ? msg : 'Error al procesar el pago. Intenta de nuevo.');
-      }
+      setError(err.response?.data?.message || 'Error al iniciar el pago con Mercado Pago');
     } finally {
       setPagando(false);
     }
   };
 
-  const formatPrice = (price) => {
-    return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP' }).format(price);
-  };
-
   if (items.length === 0) {
     return (
-      <div className="max-w-7xl mx-auto px-4 py-20 text-center">
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-          <ShoppingBag className="w-16 h-16 mx-auto mb-4 text-gray-300 dark:text-gray-600" />
-          <h2 className="text-2xl font-bold mb-2">Tu carrito está vacío</h2>
-          <p className="text-gray-500 mb-6">Agrega productos para empezar a comprar</p>
-          <Link to="/productos" className="btn-primary">
-            Ver Productos
-          </Link>
-        </motion.div>
+      <div className="max-w-3xl mx-auto px-4 py-20 text-center">
+        <div className="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
+          <svg className="w-8 h-8 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+          </svg>
+        </div>
+        <h2 className="text-2xl font-semibold text-slate-900 mb-2">Tu carrito está vacío</h2>
+        <p className="text-slate-500 text-sm mb-6">Explora nuestro catálogo y agrega productos para comenzar</p>
+        <Link to="/" className="btn-primary inline-block">Ir a la tienda</Link>
       </div>
     );
   }
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <h1 className="text-3xl font-bold mb-8">Carrito de Compras</h1>
+    <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-bold text-slate-900">Carrito de compras ({totalItems})</h1>
+        <button onClick={clearCart} className="text-xs text-slate-500 hover:text-red-600 transition">
+          Vaciar carrito
+        </button>
+      </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Items */}
-        <div className="lg:col-span-2 space-y-4">
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg p-3 mb-4">
+          {error}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="lg:col-span-2 space-y-3">
           {items.map((item) => (
-            <motion.div
-              key={item.id}
-              layout
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: 20 }}
-              className="card p-4 flex items-center gap-4"
-            >
+            <div key={item.id} className="card p-4 flex items-center gap-4">
               <img
                 src={item.imagen}
                 alt={item.nombre}
-                className="w-20 h-20 object-cover rounded-lg"
+                className="w-20 h-20 object-cover rounded-lg bg-slate-100 flex-shrink-0"
               />
               <div className="flex-1 min-w-0">
-                <h3 className="font-semibold truncate">{item.nombre}</h3>
-                <p className="text-sm text-gray-500">{item.marca}</p>
-                <p className="font-bold text-lumina-600 mt-1">{formatPrice(item.precio)}</p>
+                <p className="text-xs text-slate-400">{item.marca}</p>
+                <h3 className="font-semibold text-slate-900 text-sm truncate">{item.nombre}</h3>
+                <p className="text-sm font-medium text-slate-700 mt-1">{formatCLP(item.precio)}</p>
               </div>
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => updateQuantity(item.id, item.cantidad - 1)}
-                  className="p-1 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700"
+                  className="w-7 h-7 rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50 text-sm"
                 >
-                  <Minus className="w-4 h-4" />
+                  -
                 </button>
-                <span className="w-8 text-center font-medium">{item.cantidad}</span>
+                <span className="w-7 text-center text-sm font-medium">{item.cantidad}</span>
                 <button
                   onClick={() => updateQuantity(item.id, item.cantidad + 1)}
-                  className="p-1 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700"
+                  className="w-7 h-7 rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50 text-sm"
                 >
-                  <Plus className="w-4 h-4" />
+                  +
                 </button>
               </div>
-              <button
-                onClick={() => removeItem(item.id)}
-                className="p-2 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
-              >
-                <Trash2 className="w-5 h-5" />
-              </button>
-            </motion.div>
+              <div className="text-right min-w-[90px]">
+                <p className="font-semibold text-slate-900 text-sm">
+                  {formatCLP(item.precio * item.cantidad)}
+                </p>
+                <button
+                  onClick={() => removeItem(item.id)}
+                  className="text-xs text-slate-400 hover:text-red-600 mt-1"
+                >
+                  Quitar
+                </button>
+              </div>
+            </div>
           ))}
         </div>
 
-        {/* Resumen */}
-        <div className="card p-6 h-fit sticky top-24">
-          <h2 className="font-bold text-lg mb-4">Resumen del Pedido</h2>
-          <div className="space-y-3 text-sm">
-            <div className="flex justify-between">
-              <span className="text-gray-500">Productos ({totalItems})</span>
-              <span>{formatPrice(totalPrice)}</span>
+        <div className="card p-6 h-fit">
+          <h2 className="font-semibold text-slate-900 mb-4">Resumen de compra</h2>
+          <div className="space-y-2 text-sm border-b border-slate-200 pb-4 mb-4">
+            <div className="flex justify-between text-slate-600">
+              <span>Productos ({totalItems})</span>
+              <span>{formatCLP(totalPrice)}</span>
             </div>
-            <div className="flex justify-between">
-              <span className="text-gray-500">Envío</span>
-              <span className="text-green-600 font-medium">Gratis</span>
-            </div>
-            <hr className="border-gray-200 dark:border-gray-700" />
-            <div className="flex justify-between text-lg font-bold">
-              <span>Total</span>
-              <span className="text-lumina-600">{formatPrice(totalPrice)}</span>
+            <div className="flex justify-between text-slate-600">
+              <span>Envío</span>
+              <span className="text-emerald-600 font-medium">Gratis</span>
             </div>
           </div>
-          {error && (
-            <div className="bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-sm p-3 rounded-lg mt-4">
-              {error}
-            </div>
-          )}
+          <div className="flex justify-between items-baseline mb-6">
+            <span className="font-semibold text-slate-900">Total</span>
+            <span className="text-xl font-bold text-slate-900">{formatCLP(totalPrice)}</span>
+          </div>
+
           <button
             onClick={handlePagar}
             disabled={pagando}
-            className="btn-primary w-full mt-6 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="btn-primary w-full flex items-center justify-center gap-2 mb-3"
           >
-            {pagando ? (
-              <>
-                <Loader2 className="w-5 h-5 animate-spin" />
-                Procesando...
-              </>
-            ) : (
-              <>
-                <CreditCard className="w-5 h-5" />
-                Pagar con MercadoPago
-              </>
-            )}
+            {pagando ? 'Conectando con Mercado Pago...' : 'Pagar con Mercado Pago'}
           </button>
+
           <button
             onClick={async () => {
-              if (!isAuthenticated) { navigate('/login'); return; }
-              const demoOrdenId = 'ORD-DEMO-' + Date.now();
-              const pedido = { ordenId: demoOrdenId, estado: 'reparto', timestamp: Date.now(), items: items.length, total: totalPrice };
-              const pedidosKey = `lumina-pedidos-${user?.id || 'guest'}`;
-              const pedidos = JSON.parse(localStorage.getItem(pedidosKey) || '[]');
-              pedidos.push(pedido);
-              localStorage.setItem(pedidosKey, JSON.stringify(pedidos));
-              localStorage.setItem('lumina-last-orden', demoOrdenId);
-              // Simulacion: no pasa por ms-pagos, asi que no hay evento en SQS y el stock
-              // se descuenta directamente.
-              await Promise.all(items.map(item => bodegaService.descontarStock(item.id, item.cantidad)));
-              clearCart();
-              navigate('/pago/exitoso');
+              if (!isAuthenticated) {
+                navigate('/login');
+                return;
+              }
+              setPagando(true);
+              setError('');
+              try {
+                const demoOrdenId = 'ORD-DEMO-' + Date.now();
+                const payload = {
+                  ordenId: demoOrdenId,
+                  usuarioId: user?.id || 1,
+                  emailComprador: user?.email,
+                  items: items.map((item) => ({
+                    titulo: item.nombre,
+                    productoId: item.id,
+                    cantidad: item.cantidad,
+                    precioUnitario: Number(item.precio),
+                    descripcion: item.marca || 'Producto',
+                    imagenUrl: item.imagen || '',
+                  })),
+                };
+
+                await pagosService.simularPago(payload);
+
+                const pedido = {
+                  ordenId: demoOrdenId,
+                  estado: 'reparto',
+                  timestamp: Date.now(),
+                  items: items.length,
+                  total: totalPrice,
+                };
+                const pedidosKey = `lumina-pedidos-${user?.id || 'guest'}`;
+                const pedidos = JSON.parse(localStorage.getItem(pedidosKey) || '[]');
+                pedidos.push(pedido);
+                localStorage.setItem(pedidosKey, JSON.stringify(pedidos));
+                localStorage.setItem('lumina-last-orden', demoOrdenId);
+
+                clearCart();
+                navigate('/pago/exitoso');
+              } catch (err) {
+                setError(err.response?.data?.message || 'Error al simular el pago en ms-pagos');
+              } finally {
+                setPagando(false);
+              }
             }}
-            className="w-full mt-3 text-sm py-2.5 px-4 rounded-lg font-medium border-2 border-yellow-400 bg-yellow-50 text-yellow-700 hover:bg-yellow-100 dark:bg-yellow-900/20 dark:text-yellow-400 dark:border-yellow-600 dark:hover:bg-yellow-900/40 transition-colors flex items-center justify-center gap-2"
+            disabled={pagando}
+            className="btn-secondary w-full text-xs"
           >
-            <CreditCard className="w-4 h-4" />
-            Simular Pago (Demo)
+            {pagando ? 'Procesando simulación...' : 'Simular Pago (Demo)'}
           </button>
-          <button
-            onClick={clearCart}
-            className="btn-secondary w-full mt-3 text-sm"
-          >
-            Vaciar Carrito
-          </button>
+
+          {!isAuthenticated && (
+            <p className="text-xs text-slate-500 text-center mt-3">
+              Necesitas <Link to="/login" className="text-accent-600 font-medium">iniciar sesión</Link> para pagar
+            </p>
+          )}
         </div>
       </div>
     </div>
   );
 }
-
-export default CarritoPage;
